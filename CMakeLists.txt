@@ -24,6 +24,7 @@ if (EXISTS ${picoVscode})
 endif()
 # ====================================================================================
 set(PICO_BOARD pico_w CACHE STRING "Board type")
+set(FREERTOS_KERNEL_PATH ${CMAKE_CURRENT_SOURCE_DIR}/libs/FreeRTOS-Kernel)
 
 # Pull in Raspberry Pi Pico SDK (must be before project)
 include(pico_sdk_import.cmake)
@@ -32,11 +33,12 @@ project(BitDogLab-NN C CXX ASM)
 
 # Initialise the Raspberry Pi Pico SDK
 pico_sdk_init()
+include(${FREERTOS_KERNEL_PATH}/portable/ThirdParty/GCC/RP2040/FreeRTOS_Kernel_import.cmake)
 
 # Add executable. Default name is the project name, version 0.1
 
 add_executable(BitDogLab-NN 
-               main.c
+               src/main.c
                ${FREERTOS_KERNEL_PATH}/portable/MemMang/heap_4.c
                )
 
@@ -50,6 +52,7 @@ pico_enable_stdio_usb(BitDogLab-NN 1)
 # Add the standard library to the build
 target_link_libraries(BitDogLab-NN
         pico_stdlib
+        hardware_pwm
 )
 
 # Add the standard include files to the build
