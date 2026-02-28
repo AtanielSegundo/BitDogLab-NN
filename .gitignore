@@ -1,0 +1,9 @@
+build
+!.vscode/*
+generated/*
+CMakeFiles/*
+pico-sdk/*
+build.ninja
+cmake_install.cmake
+CMakeCache.txt
+compile_commands.json
