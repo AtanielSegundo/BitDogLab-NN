@@ -28,6 +28,14 @@ typedef enum {
     BOARD_BUTTON_JOYSTICK = 22 
 } BOARD_BUTTON;
 
+
+const char* board_button_str[] = {
+    [BOARD_BUTTON_A] = "BOARD_BUTTON_A",
+    [BOARD_BUTTON_B] = "BOARD_BUTTON_B",
+    [BOARD_BUTTON_JOYSTICK] = "BOARD_BUTTON_JOYSTICK"
+};
+
+
 // KY023
 typedef enum {
     JOYSTICK_VRX = 27,
@@ -189,9 +197,77 @@ Example 01: Button Usage
 
 #endif
 
+
+
 #ifdef BOARD_ADC_HELPERS
 
+#include "hardware/adc.h"
+
+typedef struct {
+    uint16_t x;
+    uint16_t y;
+    bool sw;   
+} JoystickState;
+
+void setup_joystick(void) {
+    adc_init();   
+    
+    adc_gpio_init(JOYSTICK_VRX); 
+    adc_gpio_init(JOYSTICK_VRY);
+    
+    gpio_init(JOYSTICK_SW);
+    gpio_set_dir(JOYSTICK_SW, GPIO_IN);
+    gpio_pull_up(JOYSTICK_SW);
+}
+
+inline JoystickState read_joystick(void) {
+    JoystickState state;
+
+    // canal 1 => GP27
+    adc_select_input(1); 
+    state.x = adc_read();
+
+    // canal 0 => GP26
+    adc_select_input(0); 
+    state.y = adc_read();
+
+    state.sw = (gpio_get(JOYSTICK_SW) == BOARD_BUTTON_ON);
+
+    return state;
+}
+
+inline float map_joystick_value(uint16_t value, float min_out, float max_out) {
+    return (float)((((float)value * (max_out - min_out)) / 4095.0f) + min_out);
+}
+
+inline int apply_joystick_deadzone(uint16_t value, uint16_t deadzone) {
+    const int DEADZONE_CENTER = 2048;
+    int diff = (int)value - DEADZONE_CENTER;
+
+    if (diff > -deadzone && diff < deadzone) {
+        return 0;
+    }
+
+    return (diff > 0) ? (diff - deadzone) : (diff + deadzone);
+}
+
+static float filtered_x = 2048.0f;
+static float filtered_y = 2048.0f;
+
+inline JoystickState apply_low_pass_filter(JoystickState raw, float* ema_alpha) {
+    filtered_x = ((*ema_alpha) * (float)raw.x) + ((1.0f - (*ema_alpha)) * filtered_x);
+    filtered_y = ((*ema_alpha) * (float)raw.y) + ((1.0f - (*ema_alpha)) * filtered_y);
+
+    JoystickState filtered;
+    filtered.x = (uint16_t)filtered_x;
+    filtered.y = (uint16_t)filtered_y;
+    filtered.sw = raw.sw;
+    
+    return filtered;
+}
+
 #endif
+
 
 #endif
 
