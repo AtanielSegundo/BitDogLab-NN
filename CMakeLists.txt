@@ -39,8 +39,17 @@ include(${FREERTOS_KERNEL_PATH}/portable/ThirdParty/GCC/RP2040/FreeRTOS_Kernel_i
 
 add_executable(BitDogLab-NN 
                src/main.c
+               src/genann.c
                ${FREERTOS_KERNEL_PATH}/portable/MemMang/heap_4.c
                )
+
+target_include_directories(BitDogLab-NN PRIVATE
+        ${CMAKE_CURRENT_LIST_DIR}
+        ${CMAKE_CURRENT_LIST_DIR}/includes
+        ${CMAKE_CURRENT_LIST_DIR}/routes
+        ${CMAKE_CURRENT_LIST_DIR}/configs
+        ${CMAKE_CURRENT_LIST_DIR}/src
+)
 
 pico_set_program_name(BitDogLab-NN "BitDogLab-NN")
 pico_set_program_version(BitDogLab-NN "0.1")
@@ -52,17 +61,12 @@ pico_enable_stdio_usb(BitDogLab-NN 1)
 # Add the standard library to the build
 target_link_libraries(BitDogLab-NN
         pico_stdlib
+        pico_rand
         hardware_pwm
+        hardware_flash
         hardware_adc
         hardware_pio
-)
-
-# Add the standard include files to the build
-target_include_directories(BitDogLab-NN PRIVATE
-        ${CMAKE_CURRENT_LIST_DIR}
-        ${CMAKE_CURRENT_LIST_DIR}/includes
-        ${CMAKE_CURRENT_LIST_DIR}/routes
-        ${CMAKE_CURRENT_LIST_DIR}/configs
+        hardware_i2c
 )
 
 add_subdirectory(libs/FLASHOPS)

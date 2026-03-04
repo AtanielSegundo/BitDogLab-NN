@@ -17,6 +17,7 @@
     #define JOYSTICK_QUEUE_SIZE (1U)
     QueueHandle_t xJoystickQueue;
 
+    SemaphoreHandle_t xMatrixMutex;
 
     void init_buttons(gpio_irq_callback_t btn_handler){
         setup_button_with_isr(BOARD_BUTTON_A,btn_handler);
@@ -27,6 +28,10 @@
     void init_rtos_handlers(void){
         xButtonsQueue  = xQueueCreate(BUTTONS_QUEUE_SIZE,  sizeof(BOARD_BUTTON));
         xJoystickQueue = xQueueCreate(JOYSTICK_QUEUE_SIZE, sizeof(JoystickState));
+        xMatrixMutex   = xSemaphoreCreateMutex();
+        if (xMatrixMutex != NULL) {
+            xSemaphoreTake(xMatrixMutex, 0); 
+        }
     }
     
 #endif
