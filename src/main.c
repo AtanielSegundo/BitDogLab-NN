@@ -24,6 +24,7 @@
 #include <math.h>
 #include "pico/stdlib.h"
 #include "pico/rand.h"
+#include "pico/multicore.h"
 #include "hardware/flash.h"
 #include "hardware/sync.h"
 
@@ -41,22 +42,16 @@
 #include "rtos.h"
 #include "gennan.h"
 
+
 /* ── RNG ──────────────────────────────────────────────────────────────────── */
 int internal_rand(void)  { return (int)(get_rand_32() >> 1); }
 int INTERNAL_RAND_MAX    = 0x7FFFFFFF;
 
 /* ── Flash: área reservada para o modelo ──────────────────────────────────── */
-/*
- * Topologia: 2 → 50 → 50 → 25
- *   total_weights = (2+1)*50 + (50+1)*50 + (50+1)*25 = 150 + 2550 + 1275 = 3975
- *   bytes         = 3975 * 8 = 31.800 bytes  →  8 setores de 4 KB = 32 KB
- *
- * Usamos os últimos 64 KB da flash (offset = 2 MB - 64 KB = 0x1F0000).
- * O código do Pico W raramente ultrapassa 512 KB, portanto não há colisão.
- */
-#define NN_FLASH_OFFSET   (PICO_FLASH_SIZE_BYTES - 64 * 1024)   /* 0x1F0000  */
-#define NN_FLASH_SECTORS  8                                      /* 32 KB     */
-#define NN_FLASH_MAGIC    0xBD42A001u  /* BitDog + versão do formato          */
+
+#define NN_FLASH_SECTORS  (16U)                                     
+#define NN_FLASH_OFFSET   (PICO_FLASH_SIZE_BYTES - (NN_FLASH_SECTORS) * 4 * 1024)
+#define NN_FLASH_MAGIC    0xBD42A001u 
 
 typedef struct {
     uint32_t magic;
@@ -65,26 +60,18 @@ typedef struct {
     int      hidden;
     int      outputs;
     int      total_weights;
+    uint32_t n_samples;
     uint32_t _pad;          /* alinha a 32 bytes para facilitar debug         */
-} NNFlashHeader;            /* sizeof = 32 bytes                              */
-
-/* ── Enumerações de estado ────────────────────────────────────────────────── */
-typedef enum { MODE_TRAINING = 0, MODE_INFERENCE } AppMode;
-typedef enum {
-    TRAIN_SHOW_LINE    = 0,
-    TRAIN_WAIT_CONFIRM,
-    TRAIN_RUNNING,
-    TRAIN_SHOW_RESULT,
-} TrainingState;
+} NNFlashHeader;            
 
 /* ── Constantes ───────────────────────────────────────────────────────────── */
 #define MATRIX_ROWS     5
 #define MATRIX_COLS     5
 #define MATRIX_CELLS    (MATRIX_ROWS * MATRIX_COLS)
 
-#define LEARNING_RATE   0.1
-#define TRAIN_EPOCHS    10
-#define INFER_THRESH    0.3
+#define LEARNING_RATE   0.05
+#define TRAIN_EPOCHS    5
+#define INFER_THRESH    0.2
 
 #define LCD_LINE_H      12
 #define LCD_BUF_SZ      64
@@ -102,32 +89,26 @@ static LedMatrix  g_matrix = {0};
 static genann    *g_ann    = NULL;
 static double     g_target_pattern[MATRIX_CELLS] = {0};
 
-/* ── Handles RTOS ─────────────────────────────────────────────────────────── */
-static SemaphoreHandle_t xTrainTriggerSem;
-static SemaphoreHandle_t xStateMutex;
-
-typedef struct {
-    AppMode       mode;
-    TrainingState train_state;
-    float         loss;
-    uint32_t      train_count;
-    float         accuracy;
-    bool          flash_status; /* true = último save ok / load ok             */
-} LCDInfo_t;
-
-static QueueHandle_t xLCDQueue;
-
 /* ── Geração de padrões round-robin ───────────────────────────────────────── */
-static const int LINE_ENDPOINTS[16][2] = {
+static const int LINE_ENDPOINTS[][2] = {
     {0,0}, {0,1}, {0,2}, {0,3}, {0,4},
+    {1,3}, {2,3}, {3,3}, {3,2}, {3,1}, {2,1}, {1,1}, {1,2}, 
     {1,4}, {2,4}, {3,4},
     {4,4}, {4,3}, {4,2}, {4,1}, {4,0},
     {3,0}, {2,0}, {1,0}
 };
-#define TOTAL_DIRECTIONS 16
-static int g_dir_order[TOTAL_DIRECTIONS] = {0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15};
+#define TOTAL_DIRECTIONS 24
+static int g_dir_order[TOTAL_DIRECTIONS] = {0,1,2,3,
+                                            4,5,6,7,
+                                            8,9,10,11,
+                                            12,13,14,
+                                            15,16,17,
+                                            18,19,20,
+                                            21,22,23
+                                        };
 static int g_dir_idx = TOTAL_DIRECTIONS;
 
+// fisher-yeates
 static void shuffle_directions(void) {
     for (int i = TOTAL_DIRECTIONS - 1; i > 0; i--) {
         int j = (int)(get_rand_32() % (i + 1));
@@ -147,7 +128,7 @@ static void shuffle_directions(void) {
  * task porque save_and_disable_interrupts() garante acesso exclusivo.
  * ═══════════════════════════════════════════════════════════════════════════ */
 
-static bool nn_save_to_flash(const genann *ann) {
+static bool nn_save_to_flash(const genann *ann, uint32_t n_samples) {
     if (!ann) return false;
 
     size_t weights_bytes = (size_t)ann->total_weights * sizeof(double);
@@ -174,6 +155,7 @@ static bool nn_save_to_flash(const genann *ann) {
         .hidden_layers = ann->hidden_layers,
         .hidden        = ann->hidden,
         .outputs       = ann->outputs,
+        .n_samples     = n_samples, 
         .total_weights = ann->total_weights,
         ._pad          = 0
     };
@@ -181,26 +163,22 @@ static bool nn_save_to_flash(const genann *ann) {
 
     /* Escreve pesos */
     memcpy(buf + sizeof(hdr), ann->weight, weights_bytes);
+    
+    xSemaphoreGive(xFlashStartSem);
+    xSemaphoreTake(xFlashReadySem, portMAX_DELAY);
 
-    /*
-     * Grava na flash.
-     *
-     * ATENÇÃO — RP2040 dual-core:
-     * save_and_disable_interrupts() só desabilita IRQs no core chamador.
-     * Se o outro core estiver executando código via XIP (flash) durante o
-     * erase/program → hard fault garantido.
-     *
-     * Solução: vTaskSuspendAll() pausa o scheduler globalmente.
-     * Como neuralNetTask está no Core 0 (mesmo core que as demais tasks),
-     * nenhuma outra task do Core 0 será escalonada durante a gravação.
-     * O Core 1 fica apenas no FreeRTOS idle (wfi) — sem acesso ao XIP.
-     */
     vTaskSuspendAll();
+
     uint32_t ints = save_and_disable_interrupts();
+
     flash_range_erase(NN_FLASH_OFFSET, erase_size);
     flash_range_program(NN_FLASH_OFFSET, buf, prog_size);
+
     restore_interrupts(ints);
+
     xTaskResumeAll();
+
+    xSemaphoreGive(xFlashDoneSem);
 
     free(buf);
     printf("[FLASH] Modelo salvo: %u pesos, %u bytes, offset=0x%X\n",
@@ -213,7 +191,7 @@ static bool nn_save_to_flash(const genann *ann) {
  * coincide com ann (a rede já deve ter sido criada com genann_init).
  * Apenas sobrescreve ann->weight; funções de ativação não são tocadas.
  */
-static bool nn_load_from_flash(genann *ann) {
+static bool nn_load_from_flash(genann *ann, uint32_t* n_samples) {
     if (!ann) return false;
 
     const uint8_t *flash_ptr = (const uint8_t *)(XIP_BASE + NN_FLASH_OFFSET);
@@ -233,7 +211,7 @@ static bool nn_load_from_flash(genann *ann) {
         printf("[FLASH] Topologia incompativel, ignorando modelo salvo\n");
         return false;
     }
-
+    *n_samples = hdr.n_samples;
     memcpy(ann->weight, flash_ptr + sizeof(hdr),
            (size_t)ann->total_weights * sizeof(double));
     printf("[FLASH] Modelo carregado: %d pesos\n", ann->total_weights);
@@ -293,7 +271,7 @@ static void matrix_show_inference(const double *out) {
         for (int col=0; col<MATRIX_COLS; col++) {
             double v = out[row*MATRIX_COLS+col];
             if (v >= INFER_THRESH) {
-                float w = 0.3f*(float)(v-INFER_THRESH)/(1.0f-INFER_THRESH);
+                float w = 0.2f*(float)(v-INFER_THRESH)/(1.0f-INFER_THRESH);
                 bdl_matrixSetPixel(&g_matrix, row, col, 0, 0, 255, w);
             }
         }
@@ -431,6 +409,15 @@ void matrixUpdateTask(void *params) {
     }
 }
 
+void core1LockoutInitTask(void *params) {
+    /* Registra o IRQ handler de lockout no Core 1.
+     * A partir daqui, multicore_lockout_start_blocking() pode pausar
+     * este core com segurança durante escritas na flash. 
+    * */
+    multicore_lockout_victim_init();
+    vTaskDelete(NULL);
+}
+
 void lcdUpdateTask(void *params) {
     ssd1306_i2c_setup();
     clear_screen();
@@ -477,35 +464,46 @@ void lcdUpdateTask(void *params) {
     }
 }
 
-/* ── Neural Net Task ─────────────────────────────────────────────────────────
- * Também é responsável pelo save (é dona de g_ann e verifica g_save_req).
- * O save é feito no início do loop de inferência, entre frames, para não
- * interromper uma sequência de treino em andamento.
- * ─────────────────────────────────────────────────────────────────────────── */
+// ── Neural Net Task ─────────────────────────────────────────────────────────
+
+#define REPLAY_SIZE 16
+typedef struct { double in[2]; double target[MATRIX_CELLS]; } ReplaySample;
+static ReplaySample replay[REPLAY_SIZE];
+static int replay_count = 0;
+
 void neuralNetTask(void *params) {
     vTaskDelay(pdMS_TO_TICKS(400));
 
-    /* Cria rede com a mesma topologia do arquivo salvo (se existir) */
-    g_ann = genann_init(2, 2, 50, 25);
+    g_ann = genann_init(2, 2, 16, 25);
     if (!g_ann) { printf("[NN] ERRO: genann_init!\n"); vTaskDelete(NULL); return; }
+
+    // XAVIER GLOROT INIT
+    double scale = sqrt(1.0 / 2.0);
+    for (int i = 0; i < g_ann->total_weights; i++) {
+        double u1 = (get_rand_32() + 1.0) / 0x100000000ULL;
+        double u2 = (get_rand_32() + 1.0) / 0x100000000ULL;
+        g_ann->weight[i] = sqrt(-2.0*log(u1)) * cos(2.0*M_PI*u2) * scale;
+    }
 
     g_ann->activation_hidden = genann_act_relu;
     g_ann->activation_output = genann_act_sigmoid;
 
     /* Tenta carregar modelo da flash */
-    g_loaded_ok = nn_load_from_flash(g_ann);
-    if (g_loaded_ok) {
+    if (gpio_get(JOYSTICK_SW) == BOARD_BUTTON_ON){
+        g_loaded_ok = nn_load_from_flash(g_ann,&g_train_count);
+        if (g_loaded_ok) {
         printf("[NN] Modelo restaurado da flash\n");
-    } else {
-        printf("[NN] Iniciando com pesos aleatorios\n");
+        } else {
+            printf("[NN] Iniciando com pesos aleatorios\n");
+        }
     }
-    printf("[NN] Topologia: 2 → 50 → 50 → 25 (sigmoid)\n");
 
     static double target[MATRIX_CELLS];
     static double nn_in[2];
     JoystickState joy = {0};
     bool triggered;
     bool last_save_ok = g_loaded_ok;
+    float lr = LEARNING_RATE;
 
     push_lcd(g_mode, g_train_state, g_last_loss, g_train_count, g_last_acc, last_save_ok);
 
@@ -515,7 +513,7 @@ void neuralNetTask(void *params) {
         if (g_save_req) {
             g_save_req = false;
             printf("[NN] Salvando na flash...\n");
-            last_save_ok = nn_save_to_flash(g_ann);
+            last_save_ok = nn_save_to_flash(g_ann,g_train_count);
             matrix_flash_feedback();   /* pisca amarelo para confirmar        */
             push_lcd(g_mode, g_train_state, g_last_loss,
                      g_train_count, g_last_acc, last_save_ok);
@@ -544,14 +542,22 @@ void neuralNetTask(void *params) {
             if (xQueuePeek(xJoystickQueue, &joy, pdMS_TO_TICKS(50)) != pdPASS)
                 { joy.x = 2048; joy.y = 2048; }
             joy_to_nn_input(joy, nn_in);
+            
+            replay[replay_count % REPLAY_SIZE] = (ReplaySample){{nn_in[0], nn_in[1]}};
+            memcpy(replay[replay_count % REPLAY_SIZE].target, target, sizeof(target));
+            replay_count++;
+            
             printf("[NN] Entrada: x=%.3f y=%.3f\n", nn_in[0], nn_in[1]);
 
             g_train_state = TRAIN_RUNNING;
             push_lcd(MODE_TRAINING, TRAIN_RUNNING,
                      g_last_loss, g_train_count, g_last_acc, last_save_ok);
-
+            
+            int n = (replay_count < REPLAY_SIZE) ? replay_count : REPLAY_SIZE;
+            lr = LEARNING_RATE / (1.0f + 0.01f * g_train_count);
             for (int ep = 0; ep < TRAIN_EPOCHS; ep++)
-                genann_train(g_ann, nn_in, target, LEARNING_RATE);
+                for (int s = 0; s < n; s++)
+                    genann_train(g_ann, replay[s].in, replay[s].target, lr);
 
             const double *out = genann_run(g_ann, nn_in);
             g_last_loss = compute_mse(out, target, MATRIX_CELLS);
@@ -583,6 +589,23 @@ void neuralNetTask(void *params) {
     }
 }
 
+// Função em RAM: não acessa flash durante a espera
+static void __not_in_flash_func(flash_guard_wait)(void) {
+    xSemaphoreGive(xFlashReadySem);           // "estou em RAM, pode gravar"
+    while (xSemaphoreTake(xFlashDoneSem, 0) != pdPASS) {
+        __wfi();                               // espera em RAM
+    }
+}
+
+void flashGuardTask(void *params) {
+    for (;;) {
+        // Bloqueia até Core 0 pedir save — custo zero
+        xSemaphoreTake(xFlashStartSem, portMAX_DELAY);
+        // Entra no loop em RAM até o save terminar
+        flash_guard_wait();
+    }
+}
+
 /* ═══════════════════════════════════════════════════════════════════════════
  * main
  * ═══════════════════════════════════════════════════════════════════════════ */
@@ -594,16 +617,16 @@ int main(void) {
     init_buttons(&ISR_HandleButtons);
     init_rtos_handlers();
 
-    xTrainTriggerSem = xSemaphoreCreateBinary();
-    xStateMutex      = xSemaphoreCreateMutex();
-    xLCDQueue        = xQueueCreate(1, sizeof(LCDInfo_t));
-
+    // CORE 0
     xTaskCreateAffinitySet(deviceAliveTask,  "Alive",    512,  NULL,  1, RP2040_CORE_0, NULL);
     xTaskCreateAffinitySet(buttonsTask,      "Buttons",  512,  NULL,  6, RP2040_CORE_0, NULL);
-    xTaskCreateAffinitySet(readJoystickTask, "Joystick", 1024, NULL, 10, RP2040_CORE_0, NULL);
-    xTaskCreateAffinitySet(matrixUpdateTask, "Matrix",   1024, NULL, 10, RP2040_CORE_0, NULL);
-    xTaskCreateAffinitySet(lcdUpdateTask,    "LCD",      2048, NULL,  7, RP2040_CORE_0, NULL);
-    xTaskCreateAffinitySet(neuralNetTask,    "NeuralNet",4096, NULL, 10, RP2040_CORE_0, NULL);
+    xTaskCreateAffinitySet(neuralNetTask,    "NeuralNet",4096, NULL,  5, RP2040_CORE_0, NULL);
+
+    // CORE 1
+    xTaskCreateAffinitySet(flashGuardTask,   "FlashGrd", 256,  NULL, configMAX_PRIORITIES-1, RP2040_CORE_1, NULL);
+    xTaskCreateAffinitySet(readJoystickTask, "Joystick", 1024, NULL, 10, RP2040_CORE_1, NULL);
+    xTaskCreateAffinitySet(matrixUpdateTask, "Matrix",   1024, NULL, 10, RP2040_CORE_1, NULL);
+    xTaskCreateAffinitySet(lcdUpdateTask,    "LCD",      2048, NULL,  7, RP2040_CORE_1, NULL);
 
     vTaskStartScheduler();
     while (true) tight_loop_contents();
