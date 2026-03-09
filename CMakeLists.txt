@@ -62,6 +62,7 @@ pico_enable_stdio_usb(BitDogLab-NN 1)
 target_link_libraries(BitDogLab-NN
         pico_stdlib
         pico_rand
+        pico_multicore
         hardware_pwm
         hardware_flash
         hardware_adc
