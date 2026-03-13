@@ -69,7 +69,7 @@ typedef struct {
 #define MATRIX_COLS     5
 #define MATRIX_CELLS    (MATRIX_ROWS * MATRIX_COLS)
 
-#define LEARNING_RATE   0.05
+#define LEARNING_RATE   0.1
 #define TRAIN_EPOCHS    5
 #define INFER_THRESH    0.2
 
@@ -235,8 +235,13 @@ static float compute_accuracy(const double *out, const double *tgt, int n) {
     return (float)ok / (float)n;
 }
 
+static int current_endpoint;
+
 static void gen_line_pattern(double *pat) {
     if (g_dir_idx >= TOTAL_DIRECTIONS) shuffle_directions();
+    
+    current_endpoint = g_dir_order[g_dir_idx];
+    
     int ep = g_dir_order[g_dir_idx++];
     int r0=2, c0=2, r1=LINE_ENDPOINTS[ep][0], c1=LINE_ENDPOINTS[ep][1];
 
@@ -271,7 +276,7 @@ static void matrix_show_inference(const double *out) {
         for (int col=0; col<MATRIX_COLS; col++) {
             double v = out[row*MATRIX_COLS+col];
             if (v >= INFER_THRESH) {
-                float w = 0.2f*(float)(v-INFER_THRESH)/(1.0f-INFER_THRESH);
+                float w = 0.1f*(float)(v-INFER_THRESH)/(1.0f-INFER_THRESH);
                 bdl_matrixSetPixel(&g_matrix, row, col, 0, 0, 255, w);
             }
         }
@@ -365,12 +370,12 @@ void buttonsTask(void *args) {
             }
             printf("[BTN] Modo: %s\n", g_mode == MODE_TRAINING ? "TREINO" : "INFERENCIA");
 
-        } else if (btn == BOARD_BUTTON_A) {
-            if (g_mode == MODE_TRAINING &&
-                (g_train_state == TRAIN_SHOW_LINE || g_train_state == TRAIN_WAIT_CONFIRM)) {
-                xSemaphoreGive(xTrainTriggerSem);
-                printf("[BTN] Treino acionado!\n");
-            }
+        // } else if (btn == BOARD_BUTTON_A) {
+        //     if (g_mode == MODE_TRAINING &&
+        //         (g_train_state == TRAIN_SHOW_LINE || g_train_state == TRAIN_WAIT_CONFIRM)) {
+        //         xSemaphoreGive(xTrainTriggerSem);
+        //         printf("[BTN] Treino acionado!\n");
+        //     }
 
         } else if (btn == BOARD_BUTTON_JOYSTICK) {
             /* Agenda save; neuralNetTask executa quando seguro */
@@ -500,6 +505,16 @@ void neuralNetTask(void *params) {
 
     static double target[MATRIX_CELLS];
     static double nn_in[2];
+    
+    static int32_t dx = 0;
+    static int32_t dy = 0;
+
+    static float ep_dx;
+    static float ep_dy;
+    static float joy_dx;
+    static float joy_dy;
+
+    JoystickState early_joy = {0};
     JoystickState joy = {0};
     bool triggered;
     bool last_save_ok = g_loaded_ok;
@@ -533,16 +548,47 @@ void neuralNetTask(void *params) {
             g_train_state = TRAIN_WAIT_CONFIRM;
             push_lcd(MODE_TRAINING, TRAIN_WAIT_CONFIRM,
                      g_last_loss, g_train_count, g_last_acc, last_save_ok);
+            
+            const uint32_t EARLY_TO_CURRENT_JOY_TOLERANCE = 64 * 64;
+            
+            if (xQueuePeek(xJoystickQueue, &early_joy, pdMS_TO_TICKS(50)) != pdPASS)
+                early_joy.x = early_joy.y = 2048;
 
             triggered = false;
-            while (g_mode == MODE_TRAINING && !triggered)
-                triggered = (xSemaphoreTake(xTrainTriggerSem, pdMS_TO_TICKS(100)) == pdPASS);
+            while (!triggered && g_mode == MODE_TRAINING) {
+                vTaskDelay(pdMS_TO_TICKS(750));
+                
+                if (xQueuePeek(xJoystickQueue, &joy, pdMS_TO_TICKS(50)) != pdPASS){
+                    continue;
+                }
+                if(joy.x == 2048 && joy.y == 2048){
+                    continue;
+                }
+
+                dx = (int32_t)joy.x - (int32_t)early_joy.x;
+                dy = (int32_t)joy.y - (int32_t)early_joy.y;
+
+                ep_dx = (LINE_ENDPOINTS[current_endpoint][1] - 2) / 2.0f; // col → x
+                ep_dy = (LINE_ENDPOINTS[current_endpoint][0] - 2) / 2.0f; // row → y
+                joy_dx = map_joystick_value(joy.x, -1.0f, 1.0f);
+                joy_dy = map_joystick_value(joy.y, -1.0f, 1.0f);
+                
+                if (joy_dx * ep_dx + joy_dy * ep_dy < 0.0f) {
+                    early_joy = joy;
+                    continue;
+                }
+
+                if ((dx*dx + dy*dy) < (int32_t)EARLY_TO_CURRENT_JOY_TOLERANCE) {
+                    triggered = true;
+                } else {
+                    early_joy = joy;
+                }
+            }
+            
             if (g_mode != MODE_TRAINING) continue;
 
-            if (xQueuePeek(xJoystickQueue, &joy, pdMS_TO_TICKS(50)) != pdPASS)
-                { joy.x = 2048; joy.y = 2048; }
             joy_to_nn_input(joy, nn_in);
-            
+
             replay[replay_count % REPLAY_SIZE] = (ReplaySample){{nn_in[0], nn_in[1]}};
             memcpy(replay[replay_count % REPLAY_SIZE].target, target, sizeof(target));
             replay_count++;
@@ -572,7 +618,7 @@ void neuralNetTask(void *params) {
             matrix_show_inference(out);
             push_lcd(MODE_TRAINING, TRAIN_SHOW_RESULT,
                      g_last_loss, g_train_count, g_last_acc, last_save_ok);
-
+            
             vTaskDelay(pdMS_TO_TICKS(1000));
 
         /* ══ MODO INFERÊNCIA ═════════════════════════════════════════════ */
