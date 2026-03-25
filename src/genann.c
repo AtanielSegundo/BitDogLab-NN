@@ -338,8 +338,10 @@ void genann_train(genann const *ann, double const *inputs, double const *desired
             double act_grad;
             if (ann->activation_hidden == genann_act_relu) {
                 act_grad = (*o > 0.0) ? 1.0 : 0.0;
+            } else if (ann->activation_hidden == genann_act_linear) {
+                act_grad = 1.0;
             } else {
-                act_grad = *o * (1.0 - *o);
+                act_grad = *o * (1.0 - *o);  /* sigmoid / sigmoid_cached */
             }
 
             *d = act_grad * delta;

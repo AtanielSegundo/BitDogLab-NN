@@ -21,7 +21,17 @@
  *  M:START,<ai>,<n>,<hl>,<h>,<lr>,<passes>,<train_len>,<val_len>
  *  M:EP,<ai>,<ep>,<tLoss>,<vLoss>,<tAcc>,<vAcc>
  *  M:DONE,<ai>,<n>,<tLoss>,<vLoss>,<tAcc>,<vAcc>,<passes>
+ *  M:MODEL_START,<ai>,<n>,<total_bytes>
+ *  M:MODEL_DATA,<ai>,<chunk_idx>,<base64_payload>
+ *  M:MODEL_END,<ai>,<n>,<total_chunks>
  *  M:ALL_DONE
+ *
+ * ── Sync protocol (--synch flag on metric_listener.py) ──────────────────────
+ *  host  → device :  M:SYNCH,<last_arch_idx>,<last_episode>
+ *  device → host  :  M:SYNCH_ACK,<last_completed_arch>
+ *
+ *  The device waits SYNCH_WAIT_MS milliseconds at startup for M:SYNCH before
+ *  falling back to a cold start (last_completed_arch = -1).
  */
 
 #include <stdio.h>
@@ -60,6 +70,13 @@ int INTERNAL_RAND_MAX     = 0x7FFFFFFF;
 #define METRIC_UART_TX_PIN  4
 #define METRIC_UART_BAUD    115200
 
+#define TRAIN_EPOCHS        100
+/* Hard cap on wall-clock time spent training a single architecture.
+ * When the limit is hit the current epoch finishes, M:DONE is emitted,
+ * and the loop advances to the next architecture normally.             */
+#define MAX_TRAIN_TIME_MIN  30
+#define MODEL_CHUNK_BYTES 45
+
 static void metric_uart_init(void) {
     uart_init(METRIC_UART, METRIC_UART_BAUD);
     gpio_set_function(METRIC_UART_TX_PIN, GPIO_FUNC_UART);
@@ -71,36 +88,182 @@ static void metric_send(const char *fmt, ...) {
     va_start(ap, fmt);
     vsnprintf(buf, sizeof(buf), fmt, ap);
     va_end(ap);
-    
-    // Print with prefix so --stdio-only mode can filter them
-    printf("%s\r\n", buf);           // ← important: M: prefix + \r\n
+    printf("%s\r\n", buf);
 }
 
+/* ═══════════════════════════════════════════════════════════════════════════
+ * Sync receive
+ *
+ * Reads lines from USB stdin (stdio) looking for M:SYNCH,<ai>,<ep>.
+ * Uses getchar_timeout_us so it never blocks the scheduler permanently.
+ * Returns true and fills *out_ai / *out_ep on success, false on timeout.
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+/* How long neuralNetTask waits for M:SYNCH before starting cold. */
+#define SYNCH_WAIT_MS  5000
+
+static bool synch_read_line(char *buf, int buf_sz, uint32_t deadline_ms) {
+    int pos = 0;
+    while (to_ms_since_boot(get_absolute_time()) < deadline_ms) {
+        int c = getchar_timeout_us(500);
+        if (c == PICO_ERROR_TIMEOUT) {
+            vTaskDelay(pdMS_TO_TICKS(1));
+            continue;
+        }
+        if (c == '\r') continue;   /* skip CR, wait for LF */
+        if (c == '\n') {
+            if (pos == 0) continue; /* blank line */
+            buf[pos] = '\0';
+            return true;
+        }
+        if (pos < buf_sz - 1)
+            buf[pos++] = (char)c;
+    }
+    return false;
+}
+
+/*
+ * Wait up to SYNCH_WAIT_MS for a M:SYNCH line from the host.
+ * Sets *out_last_completed_arch and returns true if received.
+ *
+ * Decision logic:
+ *   - if synch_ep >= TRAIN_EPOCHS-1  → arch synch_ai was fully trained
+ *                                       → last_completed_arch = synch_ai
+ *   - else                           → arch synch_ai was partial; retrain it
+ *                                       (Python dedup suppresses duplicate ep rows)
+ *                                       → last_completed_arch = synch_ai - 1
+ */
+static bool wait_for_synch(int *out_last_completed_arch) {
+    char line[64];
+    uint32_t deadline = to_ms_since_boot(get_absolute_time()) + SYNCH_WAIT_MS;
+
+    printf("[SYNCH] Waiting %d ms for M:SYNCH...\n", SYNCH_WAIT_MS);
+
+    while (synch_read_line(line, sizeof(line), deadline)) {
+        int ai, ep;
+        if (strncmp(line, "M:SYNCH,", 8) == 0 &&
+            sscanf(line + 8, "%d,%d", &ai, &ep) == 2) {
+
+            int last_completed = (ep >= TRAIN_EPOCHS - 1) ? ai : ai - 1;
+            *out_last_completed_arch = last_completed;
+
+            printf("[SYNCH] Received: ai=%d ep=%d → last_completed_arch=%d\n",
+                   ai, ep, last_completed);
+            metric_send("M:SYNCH_ACK,%d", last_completed);
+            return true;
+        }
+        /* Any other line: echo it so debug output isn't swallowed */
+        printf("[SYNCH] (ignored) %s\n", line);
+    }
+
+    printf("[SYNCH] Timeout — cold start.\n");
+    return false;
+}
 
 /* ═══════════════════════════════════════════════════════════════════════════
- * Architecture list
+ * Architecture combinators
  * ═══════════════════════════════════════════════════════════════════════════ */
 typedef double (*ActFn)(const genann *, double);
 
 typedef struct {
-    const char *name;
-    int         hidden_layers;
-    int         hidden;
-    ActFn       act_hidden;
-    ActFn       act_output;
-    double      lr;
+    char   name[32];
+    int    hidden_layers;
+    int    hidden;
+    ActFn  act_hidden;
+    ActFn  act_output;
+    double lr;
 } NNArch;
 
-static const NNArch ARCH_LIST[] = {
-    { "sig_1x8",   1,  8, genann_act_sigmoid, genann_act_sigmoid, 0.10 },
-    { "sig_2x16",  2, 16, genann_act_sigmoid, genann_act_sigmoid, 0.05 },
-    { "relu_2x16", 2, 16, genann_act_relu,    genann_act_sigmoid, 0.05 },
-    { "relu_2x32", 2, 32, genann_act_relu,    genann_act_sigmoid, 0.03 },
-    { "relu_3x32", 3, 32, genann_act_relu,    genann_act_sigmoid, 0.01 },
-    { "sig_2x32",  2, 32, genann_act_sigmoid, genann_act_sigmoid, 0.03 },
+static const int    AX_NEURONS[] = { 4, 8, 16, 32, 64 };
+static const int    AX_LAYERS [] = { 1, 2,  4,  8, 16 };
+static const double AX_LR     [] = { 0.1, 0.05, 0.01 };
+
+typedef struct { const char *tag; ActFn fn; } ActEntry;
+
+static const ActEntry AX_ACT_HIDDEN[] = {
+    { "sig",  genann_act_sigmoid },
+    { "relu", genann_act_relu    },
+    { "lin",  genann_act_linear  },
 };
-#define ARCH_COUNT   ((int)(sizeof(ARCH_LIST) / sizeof(ARCH_LIST[0])))
-#define TRAIN_PASSES 30
+static const ActEntry AX_ACT_OUTPUT[] = {
+    { "sig", genann_act_sigmoid },
+    { "lin", genann_act_linear  },
+};
+
+#define N_NEURONS     ( sizeof(AX_NEURONS)    / sizeof(AX_NEURONS[0])    )
+#define N_LAYERS      ( sizeof(AX_LAYERS)     / sizeof(AX_LAYERS[0])     )
+#define N_LR          ( sizeof(AX_LR)         / sizeof(AX_LR[0])         )
+#define N_ACT_HIDDEN  ( sizeof(AX_ACT_HIDDEN) / sizeof(AX_ACT_HIDDEN[0]) )
+#define N_ACT_OUTPUT  ( sizeof(AX_ACT_OUTPUT) / sizeof(AX_ACT_OUTPUT[0]) )
+
+#define ARCH_COUNT    (N_NEURONS * N_LAYERS * N_LR * N_ACT_HIDDEN * N_ACT_OUTPUT)
+
+static inline NNArch arch_at(int ai) {
+    int tmp = ai;
+    int io  = tmp % N_ACT_OUTPUT;  tmp /= N_ACT_OUTPUT;
+    int ih  = tmp % N_ACT_HIDDEN;  tmp /= N_ACT_HIDDEN;
+    int il  = tmp % N_LR;          tmp /= N_LR;
+    int iy  = tmp % N_LAYERS;      tmp /= N_LAYERS;
+    int in_ = tmp;
+
+    NNArch a;
+    snprintf(a.name, sizeof(a.name), "%so%s_l%dx%d_lr%g",
+             AX_ACT_HIDDEN[ih].tag, AX_ACT_OUTPUT[io].tag,
+             AX_LAYERS[iy], AX_NEURONS[in_], AX_LR[il]);
+    a.hidden_layers = AX_LAYERS[iy];
+    a.hidden        = AX_NEURONS[in_];
+    a.lr            = AX_LR[il];
+    a.act_hidden    = AX_ACT_HIDDEN[ih].fn;
+    a.act_output    = AX_ACT_OUTPUT[io].fn;
+    return a;
+}
+
+static inline bool arch_is_valid(NNArch *arch) {
+    if (arch->act_hidden == genann_act_linear &&
+        arch->act_output == genann_act_linear) return false;
+    return true;
+}
+
+static const char B64_TABLE[] =
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+static void b64_encode(const uint8_t *src, int len, char *dst) {
+    int j = 0;
+    for (int i = 0; i < len; i += 3) {
+        uint8_t b0 =             src[i];
+        uint8_t b1 = (i+1 < len) ? src[i+1] : 0;
+        uint8_t b2 = (i+2 < len) ? src[i+2] : 0;
+        dst[j++] = B64_TABLE[ b0 >> 2 ];
+        dst[j++] = B64_TABLE[((b0 & 0x03) << 4) | (b1 >> 4)];
+        dst[j++] = (i+1 < len) ? B64_TABLE[((b1 & 0x0f) << 2) | (b2 >> 6)] : '=';
+        dst[j++] = (i+2 < len) ? B64_TABLE[  b2 & 0x3f ]                    : '=';
+    }
+    dst[j] = '\0';
+}
+
+static void metric_send_model(int ai, const char *name, const genann *ann) {
+    const uint8_t *data  = (const uint8_t *)ann->weight;
+    int            total = ann->total_weights * (int)sizeof(double);
+
+    char b64buf[ (MODEL_CHUNK_BYTES / 3) * 4 + 5 ];
+
+    metric_send("M:MODEL_START,%d,%s,%d", ai, name, total);
+
+    int chunk = 0;
+    for (int off = 0; off < total; off += MODEL_CHUNK_BYTES) {
+        int chunk_len = total - off;
+        if (chunk_len > MODEL_CHUNK_BYTES) chunk_len = MODEL_CHUNK_BYTES;
+
+        b64_encode(data + off, chunk_len, b64buf);
+        metric_send("M:MODEL_DATA,%d,%d,%s", ai, chunk, b64buf);
+        chunk++;
+
+        vTaskDelay(pdMS_TO_TICKS(5));
+    }
+
+    metric_send("M:MODEL_END,%d,%s,%d", ai, name, chunk);
+    printf("[MODEL] Sent %s: %d bytes in %d chunks\n", name, total, chunk);
+}
 
 /* ═══════════════════════════════════════════════════════════════════════════
  * Display types
@@ -121,7 +284,7 @@ typedef struct {
     int      pass;
     float    train_loss, val_loss;
     float    train_acc,  val_acc;
-    bool     has_model;  /* true once at least one arch has finished */
+    bool     has_model;
 } LCDPayload;
 
 static QueueHandle_t xLCDQ;
@@ -154,7 +317,7 @@ static void eval_split(genann *ann,
         const double *pred = genann_run(ann, ins[i]);
         ms += compute_mse(pred, outs[i], MATRIX_CELLS);
         as += compute_acc(pred, outs[i], MATRIX_CELLS);
-        if ((i & 31) == 31) vTaskDelay(1); /* keep Core 1 tasks alive */
+        if ((i & 31) == 31) vTaskDelay(1);
     }
     *mse_out = count > 0 ? ms / count : 1.0f;
     *acc_out = count > 0 ? as / count : 0.0f;
@@ -183,7 +346,6 @@ static void xavier_init(genann *ann) {
  * ═══════════════════════════════════════════════════════════════════════════ */
 static LedMatrix g_matrix = {0};
 
-/* Inference display — identical to main.c matrix_show_inference */
 static void matrix_show_inference(const double *out) {
     if (xSemaphoreTake(xMatrixMutex, pdMS_TO_TICKS(100)) != pdPASS) return;
     bdl_matrixClear(&g_matrix);
@@ -199,12 +361,11 @@ static void matrix_show_inference(const double *out) {
     xSemaphoreGive(xMatrixMutex);
 }
 
-/* Training progress: one row per arch, fills left→right */
 static void matrix_train_progress(int arch_idx, int ep) {
     if (xSemaphoreTake(xMatrixMutex, pdMS_TO_TICKS(50)) != pdPASS) return;
     bdl_matrixClear(&g_matrix);
     int row = arch_idx % MATRIX_ROWS;
-    int lit = (int)((float)(ep + 1) / TRAIN_PASSES * MATRIX_COLS);
+    int lit = (int)((float)(ep + 1) / TRAIN_EPOCHS * MATRIX_COLS);
     for (int c = 0; c < lit && c < MATRIX_COLS; c++)
         bdl_matrixSetPixel(&g_matrix, row, c, 0, 200, 80, 0.08f);
     xSemaphoreGive(xMatrixMutex);
@@ -213,8 +374,8 @@ static void matrix_train_progress(int arch_idx, int ep) {
 /* ═══════════════════════════════════════════════════════════════════════════
  * Global flags
  * ═══════════════════════════════════════════════════════════════════════════ */
-static volatile ExpMode g_mode      = EXP_MODE_TRAINING;
-static volatile bool    g_skip_arch = false;
+static volatile ExpMode g_mode              = EXP_MODE_TRAINING;
+static volatile bool    g_skip_arch         = false;
 static volatile bool    g_retrain_requested = true;
 
 /* ═══════════════════════════════════════════════════════════════════════════
@@ -313,7 +474,7 @@ void lcdUpdateTask(void *p) {
             snprintf(buf, sizeof(buf), "[TRAIN] %d/%d", info.arch_idx + 1, ARCH_COUNT);
             ssd1306_draw_string((uint8_t *)ssd, 0, y, buf); y += LCD_LINE_H;
             ssd1306_draw_string((uint8_t *)ssd, 0, y, (char *)info.arch_name); y += LCD_LINE_H;
-            snprintf(buf, sizeof(buf), "Ep %d/%d", info.pass + 1, TRAIN_PASSES);
+            snprintf(buf, sizeof(buf), "Ep %d/%d", info.pass + 1, TRAIN_EPOCHS);
             ssd1306_draw_string((uint8_t *)ssd, 0, y, buf); y += LCD_LINE_H;
             snprintf(buf, sizeof(buf), "tL%.4f vL%.4f",
                      (double)info.train_loss, (double)info.val_loss);
@@ -341,11 +502,9 @@ void neuralNetTask(void *p) {
     (void)p;
     vTaskDelay(pdMS_TO_TICKS(600));
 
-    static int last_completed_arch = -1;
     static int train_idx[DATASET_TRAIN_LEN];
     for (int i = 0; i < DATASET_TRAIN_LEN; i++) train_idx[i] = i;
-    
-    /* Last fully-trained model — lives in RAM, used directly for inference */
+
     genann *inf_ann           = NULL;
     char    inf_arch_name[16] = {0};
     float   inf_val_loss      = 1.0f;
@@ -353,15 +512,22 @@ void neuralNetTask(void *p) {
 
     LCDPayload lcd = {0};
 
+    /* ── Announce boot, then wait for optional M:SYNCH ─────────────────── */
     metric_send("M:BOOT");
 
     lcd.mode = EXP_MODE_TRAINING;
+    strncpy(lcd.arch_name, "Sync wait...", 15);
+    push_lcd(&lcd);
+
+    int last_completed_arch = -1;
+    wait_for_synch(&last_completed_arch);  /* sets last_completed_arch if synch received */
+
     strncpy(lcd.arch_name, "Starting...", 15);
     push_lcd(&lcd);
 
     for (;;) {
 
-        /* ══ INFERENCE MODE — identical to main.c ═══════════════════════════ */
+        /* ══ INFERENCE MODE ═════════════════════════════════════════════════ */
         if (g_mode == EXP_MODE_INFERENCE) {
             lcd.mode      = EXP_MODE_INFERENCE;
             lcd.has_model = (inf_ann != NULL);
@@ -388,30 +554,53 @@ void neuralNetTask(void *p) {
         for (int ai = 0; ai < ARCH_COUNT; ai++) {
             if (g_mode != EXP_MODE_TRAINING) break;
 
-            // ── Skip already trained architectures ───────────────────────
             if (ai <= last_completed_arch) {
-                printf("[TRAIN] Skipping already trained: %s\n", ARCH_LIST[ai].name);
+                const NNArch arch = arch_at(ai);
+                printf("[TRAIN] Skipping already trained: %s\n", arch.name);
                 continue;
             }
 
-            const NNArch *arch = &ARCH_LIST[ai];
+            NNArch arch = arch_at(ai);
+            if (!arch_is_valid(&arch)) {
+                metric_send("[TRAIN] Skipping,%d,%s,degenerate", ai, arch.name);
+                continue;
+            }
+
             printf("[TRAIN] ── Arch %d/%d: %s  (hl=%d h=%d lr=%.4f) ──\n",
-                   ai + 1, ARCH_COUNT, arch->name,
-                   arch->hidden_layers, arch->hidden, arch->lr);
+                   ai + 1, ARCH_COUNT, arch.name,
+                   arch.hidden_layers, arch.hidden, arch.lr);
 
             metric_send("M:START,%d,%s,%d,%d,%.5f,%d,%d,%d",
-                        ai, arch->name, arch->hidden_layers, arch->hidden,
-                        arch->lr, TRAIN_PASSES, DATASET_TRAIN_LEN, DATASET_VAL_LEN);
+                        ai, arch.name, arch.hidden_layers, arch.hidden,
+                        arch.lr, TRAIN_EPOCHS, DATASET_TRAIN_LEN, DATASET_VAL_LEN);
 
-            genann *ann = genann_init(2, arch->hidden_layers, arch->hidden, MATRIX_CELLS);
+            /* Free inference model first to reclaim RAM — large networks
+             * (e.g. 16 hidden layers × 16 neurons) need ~36 KB each and
+             * the Pico cannot hold two simultaneously.                    */
+            if (inf_ann) { genann_free(inf_ann); inf_ann = NULL; }
+
+            genann *ann = genann_init(2, arch.hidden_layers, arch.hidden, MATRIX_CELLS);
             if (!ann) { printf("[TRAIN] genann_init failed\n"); continue; }
-            ann->activation_hidden = arch->act_hidden;
-            ann->activation_output = arch->act_output;
+            ann->activation_hidden = arch.act_hidden;
+            ann->activation_output = arch.act_output;
             xavier_init(ann);
 
             g_skip_arch = false;
 
-            for (int ep = 0; ep < TRAIN_PASSES; ep++) {
+            /* ── Per-architecture wall-clock timer ──────────────────────── */
+            absolute_time_t arch_start = get_absolute_time();
+            const int64_t   max_us     = (int64_t)MAX_TRAIN_TIME_MIN * 60LL * 1000000LL;
+            bool            timed_out  = false;
+
+            for (int ep = 0; ep < TRAIN_EPOCHS; ep++) {
+                int64_t elapsed = absolute_time_diff_us(arch_start, get_absolute_time());
+                if (elapsed >= max_us) {
+                    printf("[TRAIN] %s timed out at ep=%d (>%d min)\n",
+                           arch.name, ep, MAX_TRAIN_TIME_MIN);
+                    timed_out = true;
+                    break;
+                }
+
                 if (g_mode != EXP_MODE_TRAINING || g_skip_arch) break;
 
                 shuffle_indices(train_idx, DATASET_TRAIN_LEN,
@@ -421,7 +610,7 @@ void neuralNetTask(void *p) {
                     genann_train(ann,
                                  dataset_input [train_idx[si]],
                                  dataset_output[train_idx[si]],
-                                 arch->lr);
+                                 arch.lr);
                     if ((si & 31) == 31) vTaskDelay(1);
                 }
 
@@ -442,20 +631,22 @@ void neuralNetTask(void *p) {
                 lcd.pass       = ep;
                 lcd.train_loss = tl; lcd.val_loss = vl;
                 lcd.train_acc  = ta; lcd.val_acc  = va;
-                strncpy(lcd.arch_name, arch->name, 15);
+                strncpy(lcd.arch_name, arch.name, 15);
                 push_lcd(&lcd);
 
                 matrix_train_progress(ai, ep);
 
                 printf("[TRAIN] %s  ep=%d  tL=%.4f vL=%.4f  tA=%.0f%% vA=%.0f%%\n",
-                       arch->name, ep,
+                       arch.name, ep,
                        (double)tl, (double)vl,
                        (double)(ta * 100.0f), (double)(va * 100.0f));
 
                 vTaskDelay(pdMS_TO_TICKS(2));
             }
 
-            /* Final metrics */
+            (void)timed_out;
+
+            /* ── Final eval & M:DONE ──────────────────────────────────────── */
             float tl, ta, vl, va;
             eval_split(ann, dataset_input, dataset_output, DATASET_TRAIN_LEN, &tl, &ta);
             eval_split(ann,
@@ -464,18 +655,21 @@ void neuralNetTask(void *p) {
                        DATASET_VAL_LEN, &vl, &va);
 
             metric_send("M:DONE,%d,%s,%.6f,%.6f,%.4f,%.4f,%d",
-                        ai, arch->name,
+                        ai, arch.name,
                         (double)tl, (double)vl,
-                        (double)ta, (double)va, TRAIN_PASSES);
+                        (double)ta, (double)va, TRAIN_EPOCHS);
 
-            // ── Only update last_completed_arch when we fully finish an arch ──
+            /* ── Stream model weights to metric_listener ────────────────── */
+            metric_send_model(ai, arch.name, ann);
+
+            /* ── Keep best model in RAM for inference ────────────────────── */
             if (g_mode == EXP_MODE_TRAINING && !g_skip_arch) {
-                last_completed_arch = ai;               // ← key line
+                last_completed_arch = ai;
 
                 if (inf_ann) genann_free(inf_ann);
                 inf_ann = ann;
-                ann = NULL;
-                strncpy(inf_arch_name, arch->name, sizeof(inf_arch_name)-1);
+                ann     = NULL;
+                strncpy(inf_arch_name, arch.name, sizeof(inf_arch_name) - 1);
                 inf_val_loss = vl;
                 inf_val_acc  = va;
                 printf("[INF] Best so far updated to %s (ai=%d)\n", inf_arch_name, ai);
@@ -495,9 +689,6 @@ void neuralNetTask(void *p) {
     }
 }
 
-/* ═══════════════════════════════════════════════════════════════════════════
- * main
- * ═══════════════════════════════════════════════════════════════════════════ */
 int main(void) {
     stdio_init_all();
     sleep_ms(2000);
